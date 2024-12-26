@@ -24,11 +24,11 @@ initial_port = sys.argv[1]
 
 api_v1 = jsonrpc.Entrypoint('/api/v1/jsonrpc')
 
-ping_timeout = 0.1
+ping_timeout = 0.2
 vote_timeout = 0.2
-action_timeout = 0.01
-hb_timer = 0.04
-drop_timeout = 0.5
+action_timeout = 0.1
+hb_timer = 0.3
+drop_timeout = 2
 sleep_max_time = 0.6
 
 class RepeatTimer(Timer):
@@ -41,32 +41,48 @@ class MyError(jsonrpc.BaseError):
 
     class DataModel(BaseModel):
         details: str
+
 class AddNodeIn(BaseModel):
     item: int
 class AddNodeOut(BaseModel):
     leader: int
-class UpdateValIn(BaseModel):
-    term: int
-    node_list: list[int]
-    leader: int
-class UpdateValOut(BaseModel):
-    status:bool
+
 class VotingIn(BaseModel):
     term: int
     port: int
 
+class AppendEntriesIn(BaseModel):
+    term: int #term leader’sterm 
+    leaderId: int # sofollowercanredirectclients
+    prevLogIndex: int # index of log entry immediately preceding new ones
+    prevLogTerm: int # term of prev Log Indexentry
+    entries: list[tuple[str, int, int]] #logentriestostore(emptyforheartbeat; maysendmorethanoneforefficiency)
+    leaderCommit: int #leader’s commitIndex
+
+class AppendEntriesOut(BaseModel):
+    term: int# currentTerm,forleadertoupdateitself
+    success: bool# trueiffollowercontainedentrymatching prevLogIndexandprevLogTerm
+    
 class MySyncObj():
     cur_host = 'localhost'
-    cur_port = int(initial_port) #8010
     role = "follower" #'leader'
-    term = 1
-    nodes : Dict[int, Any] = {cur_port:datetime.now()}#, 8016:0} # 8010
+
+    cur_port = int(initial_port) #8010
+    term = 0
     leader_port = 8010
-    last_ping = datetime.now()
+
     vote_for = None
+    log : list[(str, int ,int)]= [("Born", cur_port, term)] # index (log, target ,term)
+    commitIndex = 0
+    lastApplied = 0 ####
+
+    nextIndex = {} #####
+    matchIndex : Dict[int,int] = {} # node, idx
+
+    nodes : Dict[int, Any] = {}#, 8016:0} # 8010
     vote_start = datetime.now()
     already_sleep = False
-
+    last_ping = datetime.now()
     #HB
     steps = (drop_timeout//hb_timer)//3
     curr_step = 0
@@ -74,6 +90,8 @@ class MySyncObj():
     def __init__(self):
         self.timer = RepeatTimer(action_timeout, self.do_work)
         self.heartbeat = RepeatTimer(hb_timer, self.hearthbit)
+        print("connect")
+        asyncio.run(self.connect_to_net(self.leader_port))
 
     async def connect_to_net(self, port):
         url = "http://"+ self.cur_host + ":" + str(port) + "/api/v1/jsonrpc"
@@ -91,92 +109,98 @@ class MySyncObj():
         leader_get = port
 
         try:
-            response = requests.post(url, json=data, headers=headers, timeout=vote_timeout)
+            response = requests.post(url, json=data, headers=headers, timeout=1)
             leader_get = response.json()["result"]["leader"]
-            print("Succ connect")
         except Exception as e:
-            print("Fail connect: ", e)
-   
-        if(leader_get != port and leader_get != self.cur_port):
+            print("Fail connect ")
+        
+        if leader_get == self.cur_port:
+            self.new_log("Add", self.cur_port, self.term)
+            self.term = self.term + 1 
+            self.new_log("Lead", self.cur_port, self.term)
+        elif (leader_get == port):
+            print("Succ connect ", port)
+            self.leader_port = port
+            self.last_ping = datetime.now()
+        else:
             self.connect_to_net(leader_get)
+           
+    def new_log(self, act, target, term):
+        if (act == "Add"):
+            if target in self.nodes:
+                return
+            self.nodes[target] = datetime.now()
+            self.matchIndex[target] = 0
+        if (act == "Drop"):
+            if  target in self.nodes:
+                del self.nodes[target]
+                del self.matchIndex[target]
+            else:
+                return
+        if act == "Lead":
+           self.leader_port = target
+           if self.cur_port == target:
+               self.role = "leader"
+               self.heartbeat.start()
+        
+        self.commitIndex = self.commitIndex + 1
+        self.log.append((act, target, term))
+        print("New log ", act, target, term)
 
-    async def update_follower(self, node):
+    async def append(self, node):
         url = "http://"+ self.cur_host + ":" + str(node) + "/api/v1/jsonrpc"
         headers = {'content-type': 'application/json'}
-        node_list = list(self.nodes.keys())
+        
+        prevLogIndex = self.matchIndex[node]
+        prevLogTerm = self.log[prevLogIndex][2]
+        entries = self.log[prevLogIndex+1:self.commitIndex+1] 
         data = {
             "jsonrpc": "2.0",
-            "method": "update",
+            "method": "append",
             "id": 1,
             "params": {
             "in_params": {
                 "term": self.term,
-                "node_list": node_list,
-                "leader": self.cur_port
+                "leaderId": self.cur_port,
+                "prevLogIndex": prevLogIndex,
+                "prevLogTerm": prevLogTerm,
+                "entries": entries,
+                "leaderCommit": self.commitIndex
             }
         }
         }
         try:
             response = requests.post(url, json=data, headers=headers, timeout=ping_timeout)
+            if response.status_code ==  200:
+                self.nodes[node] = datetime.now()
+                if response.json()["result"]["term"] > self.term:
+                    self.role = "follower"
+                elif response.json()["result"]["success"]:
+                    self.matchIndex[node] = self.commitIndex
+                else:
+                    self.matchIndex[node] = self.matchIndex[node] - 1
+                return
         except Exception as e:
-            print(f"Node {node} update failed")
-
-
-    def notificate_followers(self):
-        tasks = [asyncio.create_task(self.update_follower(x)) for x in self.nodes if x != self.cur_port]
-               
-    async def ping_node(self, node):
-        url = f"http://{self.cur_host}:{node}/api/v1/jsonrpc"
-        headers = {'content-type': 'application/json'}
-        data = {
-            "jsonrpc": "2.0",
-            "method": "ping",
-            "id": 1,
-            "params": {}
-        }
-        status = 400
-          
-        try:
-            response = requests.post(url, json=data, headers=headers, timeout=ping_timeout)
-            status = response.status_code
-        except Exception as e:
-            print(f"Node {node} ping failed")
-
-        if status == 200:
-            self.nodes[node] = datetime.now()
-            if response.json().get("result") != self.term:
-                print("desinchrone with ", node)
-                await self.update_follower(node)  
+            print(f"Node {node} append failed ")
         
-        if node in self.nodes and self.nodes[node] + timedelta(seconds=drop_timeout) <= datetime.now():
-            return node
-
-    async def send_ping_requests(self, nodes_hb):
-        if (self.role != "leader"):
-            self.heartbeat.cancel()
-
-        tasks = []
-        for node in nodes_hb:
-            if node != self.cur_port:
-                tasks.append(self.ping_node(node))
-
-        results = await asyncio.gather(*tasks)
-        dropped_nodes = [node for node in results if node is not None]
-        if len(dropped_nodes) > 0:
-            for x in dropped_nodes:
-                if x in self.nodes:
-                    del self.nodes[x]  
-            print(f"Drop Node {dropped_nodes}")
-            self.term = self.term + 1
-            self.notificate_followers()     
+        if (self.nodes[node] + timedelta(seconds=drop_timeout) < datetime.now()):
+            self.new_log("Drop", node, self.term)
+        
     
     def hearthbit(self):
-        nodes_list = list(self.nodes.keys())
-        nodes_hb = nodes_list[int(len(nodes_list)*self.curr_step//self.steps) : int(len(nodes_list)*(self.curr_step + 1)//self.steps)]
-        self.curr_step = (self.curr_step + 1)%self.steps
+        # nodes_list = list(self.nodes.keys())
+        # nodes_hb = nodes_list[int(len(nodes_list)*self.curr_step//self.steps) : int(len(nodes_list)*(self.curr_step + 1)//self.steps)]
+        # self.curr_step = (self.curr_step + 1)%self.steps
 
-        asyncio.run(self.send_ping_requests(nodes_hb))        
-            
+        # asyncio.run(self.send_ping_requests(nodes_hb))        
+        # tasks = [asyncio.create_task(self.append(x)) for x in self.nodes.keys() if x != self.cur_port]
+        asyncio.run(self.KostbILb())
+    
+    async def KostbILb(self):
+        tasks = [asyncio.create_task(self.append(x)) for x in self.nodes.keys() if x != self.cur_port]
+        # print("hb", self.log, self.commitIndex)
+        results = await asyncio.gather(*tasks)
+     
     async def send_vote_request(self, node):
         url = f"http://{self.cur_host}:{node}/api/v1/jsonrpc"
         headers = {'content-type': 'application/json'}
@@ -220,7 +244,9 @@ class MySyncObj():
             if (votes >len(tasks)/2 and self.role == "candidat"):               
                 self.role = "leader"
                 self.leader_port = self.cur_port
-                my_raft.notificate_followers()
+                if len(self.nodes) == 0:
+                    self.new_log("Add", self.cur_port, self.term)
+                self.new_log("Lead", self.cur_port, self.term)
                 try :
                     self.heartbeat.start()
                 except Exception:
@@ -234,15 +260,14 @@ class MySyncObj():
         
     def do_work(self):
         # print(f"hello im {self.cur_port} ({self.leader_port}), {self.role}, {self.term}")
-        if self.leader_port not in self.nodes and self.role != "leader":
-            asyncio.run(self.connect_to_net(self.leader_port))
+          
         if self.role == "follower":
             if  self.vote_start + timedelta(seconds=vote_timeout) <= datetime.now() and self.vote_for != None:
                 print("end vote round")
                 self.vote_for = None
             if self.last_ping + timedelta(seconds=drop_timeout) <= datetime.now() and self.vote_for == None and not self.already_sleep:
-                print("leader Drop")
-                asyncio.run(self.coronation())
+                print("leader Drop ", datetime.now())
+                # asyncio.run(self.coronation())
 
     def start(self):
         self.timer.start()
@@ -254,39 +279,37 @@ class MySyncObj():
 @api_v1.method(errors=[MyError])
 async def add_to_list(in_params: AddNodeIn) -> AddNodeOut:
     if (my_raft.role != "follower"):
-        print("new node ", in_params.item)
-        my_raft.nodes[in_params.item] = datetime.now()
-        my_raft.term = my_raft.term + 1
-        print("All node ", my_raft.nodes.keys())
-        my_raft.notificate_followers()        
+        my_raft.new_log("Add", in_params.item, my_raft.term)
     else:
         print(f"route {in_params.item} to leader {my_raft.leader_port}")
     return AddNodeOut(leader=my_raft.leader_port) 
 
 @api_v1.method(errors=[MyError])
-async def update(in_params: UpdateValIn) -> UpdateValOut:
+async def append(in_params: AppendEntriesIn) -> AppendEntriesOut:
+    # print("app get", my_raft.log, in_params)
     if(my_raft.term > in_params.term):
-        print("Update term problem")
-        return UpdateValOut(status= False) 
-
-    my_raft.role = "follower"
-    my_raft.leader_port = in_params.leader
+        return AppendEntriesOut(term= my_raft.term, success= False)
     my_raft.last_ping = datetime.now()
-    my_raft.nodes[my_raft.leader_port] = datetime.now()
+    if(my_raft.role != "follower"):
+        print("WTF")
+        my_raft.role = "follower"
+    if(my_raft.commitIndex == in_params.prevLogIndex == in_params.leaderCommit and in_params.prevLogTerm == my_raft.log[in_params.prevLogIndex-1][2]):
+        return AppendEntriesOut(term= my_raft.term, success= True)
+        
+    if(my_raft.commitIndex < in_params.prevLogIndex or 
+       (my_raft.commitIndex == in_params.prevLogIndex and my_raft.log[in_params.prevLogIndex - 1][2] != in_params.prevLogTerm)):
+        return AppendEntriesOut(term= my_raft.term, success= False) 
+    
+
+    my_raft.leader_port = in_params.leaderId
+    my_raft.log = my_raft.log[:in_params.prevLogIndex+1]
+    for x in in_params.entries:
+        my_raft.new_log(x[0], x[1], x[2])
 
     my_raft.term = in_params.term
-    print(in_params.node_list)
-    if in_params.node_list is not None and isinstance(in_params.node_list, list):
-        my_raft.nodes = {key: 0 for key in in_params.node_list}
-        print(f"hello im {my_raft.cur_port}({my_raft.leader_port}), {my_raft.role}, {my_raft.term}")
+    my_raft.commitIndex = in_params.leaderCommit
 
-    return UpdateValOut(status= True) 
-
-@api_v1.method(errors=[MyError])
-async def ping() -> int:
-    my_raft.last_ping = datetime.now()
-    my_raft.nodes[my_raft.leader_port] = datetime.now()
-    return my_raft.term
+    return AppendEntriesOut(term = my_raft.term, success= True) 
 
 @api_v1.method(errors=[MyError])
 async def vote(in_params: VotingIn) -> bool:
