@@ -25,11 +25,11 @@ initial_port = sys.argv[1]
 
 api_v1 = jsonrpc.Entrypoint('/api/v1/jsonrpc')
 
-ping_timeout = 0.2
-vote_timeout = 0.2
+ping_timeout = 0.1
+vote_timeout = 0.1
 action_timeout = 0.1
-hb_timer = 0.3
-drop_timeout = 3
+hb_timer = 0.1
+drop_timeout = 0.5
 sleep_max_time = 2
 
 class RepeatTimer(Timer):
@@ -119,20 +119,16 @@ class MySyncObj():
         leader_get = port
 
         try:
-            response = requests.post(url, json=data, headers=headers, timeout=1)
+            response = requests.post(url, json=data, headers=headers, timeout=drop_timeout)
             leader_get = response.json()["result"]["leader"]
         except Exception as e:
             print("Fail connect ")
         
-        if leader_get == self.cur_port:
-            self.new_log("Add", self.cur_port, self.term)
-            self.term = self.term + 1 
-            self.new_log("Lead", self.cur_port, self.term)
-        elif (leader_get == port):
+        if (leader_get == port) and  (port != leader_get):
             print("Succ connect ", port)
             self.leader_port = port
-            self.wait(drop_timeout)
-        else:
+            self.wait(time = drop_timeout)
+        elif (port != leader_get):
             self.connect_to_net(leader_get)
            
     def new_log(self, act, target, term):
@@ -149,9 +145,6 @@ class MySyncObj():
                 return
         if act == "Lead":
            self.leader_port = target
-           if self.cur_port == target:
-               self.role = "leader"
-               self.heartbeat.start()
         
         self.commitIndex = self.commitIndex + 1
         self.log.append((act, target, term))
@@ -185,15 +178,16 @@ class MySyncObj():
                 self.nodes[node] = datetime.now()
                 if response.json()["result"]["term"] > self.term:
                     self.role = "follower"
+                    print("WTF App", node)
                 elif response.json()["result"]["success"]:
                     self.matchIndex[node] = self.commitIndex
                 else:
                     self.matchIndex[node] = self.matchIndex[node] - 1
                 return
         except Exception as e:
-            print(f"Node {node} append failed ")
+            print(f"Node {node} append failed")
         
-        if (self.nodes[node] + timedelta(seconds=drop_timeout) < datetime.now()):
+        if (node in self.nodes and self.nodes[node] + timedelta(seconds=drop_timeout) < datetime.now()):
             self.new_log("Drop", node, self.term)
         
     def hearthbit(self):
@@ -228,13 +222,14 @@ class MySyncObj():
         }
 
         try:
-            response = requests.post(url, json=data, headers=headers, timeout=vote_timeout)
+            response = requests.post(url, json=data, headers=headers, timeout=vote_timeout/2)
             print(f"{node} vote responded {response.json()['result']['voteGranted']}")
             if response.status_code == 200 and response.json()['result']['voteGranted']:
                 return 1
             if response.status_code == 200 and response.json()['result']['term'] > self.term:
                 self.role = "follower"
                 self.term = response.json()['result']['term']
+                print("WTF Vote")
                 return 0
         except requests.exceptions.RequestException as e:
             print(f"{node} vote failed")
@@ -245,16 +240,17 @@ class MySyncObj():
             votes = 1
             self.term = self.term + 1
             # self.send_vote_request(8016)
-            print(datetime.now())
+            # print(datetime.now())
             tasks = [asyncio.create_task(self.send_vote_request(node)) for node in self.nodes if node != self.cur_port]
             results = await asyncio.gather(*tasks, return_exceptions=True)
-            print(datetime.now())
+            # print(datetime.now())
             votes = sum(results) + 1
             print(f"Election finished\n{votes}/{len(tasks)}")
 
             if (votes >len(tasks)/2 and self.role == "candidat"):               
                 self.role = "leader"
                 self.leader_port = self.cur_port
+                self.vote_state = "drop"
                 if len(self.nodes) == 0:
                     self.new_log("Add", self.cur_port, self.term)
                 self.new_log("Lead", self.cur_port, self.term)
@@ -262,7 +258,11 @@ class MySyncObj():
                     self.heartbeat.start()
                 except Exception:
                     print("Double timer!!")
-                print(f"hello im {self.leader_port}, {self.role}, {self.term}")
+                print(f"hello im {self.leader_port}, {self.role}, {self.term}, {self.log}")
+                for x in self.nodes.keys():
+                    self.nodes[x] = datetime.now()
+                    self.matchIndex[x] = self.commitIndex
+                await self.KostbILb()
             else:
                 print("folower...")
                 self.role = "follower"
@@ -271,32 +271,34 @@ class MySyncObj():
         if self.role == "follower":
             if self.vote_state == "drop":
                 sleep_duration = random.uniform(0, sleep_max_time) 
-                print("leader Drop. sleep ", sleep_duration*1000//1, datetime.now())
+                print("leader Drop. sleep ", sleep_duration*1000//1)
                 self.vote_state = "sleep"
                 self.vote_for = None
-                self.wait(sleep_duration)
+                self.wait(time = sleep_duration)
             elif self.vote_state == "sleep" and self.vote_for == None:
-                print("try to lead", datetime.now())
+                print("try to lead")
                 self.role = "candidat"
                 self.vote_state = "drop"
                 self.vote_for = self.cur_port
                 asyncio.run(self.coronation())
-                self.wait(vote_timeout)
+                self.wait(time = vote_timeout)
             else:
                 sleep_duration = random.uniform(0, sleep_max_time) 
                 print("end_vote. sleep ", sleep_duration*1000//1)
                 self.vote_state = "sleep"
                 self.vote_for = None
-                self.wait(sleep_duration)
+                self.wait(time = sleep_duration)
+            return
         if self.role == "candidat":
             self.role = "follower"
             print("WTF")
         self.wait()
 
     def start(self):
-        self.wait(drop_timeout)
+        self.wait(time = drop_timeout)
 
     def stop(self):
+        print(self.log)
         self.heartbeat.cancel()
         self.riot.cancel()
 
@@ -314,10 +316,10 @@ async def append(in_params: AppendEntriesIn) -> AppendEntriesOut:
     if(my_raft.term > in_params.term):
         return AppendEntriesOut(term= my_raft.term, success= False)
     
-    my_raft.wait(drop_timeout)
+    my_raft.wait(time = drop_timeout)
     my_raft.vote_state = "drop"
 
-    if(my_raft.role != "follower"):
+    if(my_raft.role != "follower" and my_raft.term < in_params.term):
         print("WTF")
         my_raft.role = "follower"
     if(my_raft.commitIndex == in_params.prevLogIndex == in_params.leaderCommit and in_params.prevLogTerm == my_raft.log[in_params.prevLogIndex-1][2]):
@@ -346,8 +348,12 @@ async def vote(in_params: VoteIn) -> VoteOut:
         my_raft.term = in_params.term
         print("request vote for ", in_params.candidateId)
         return VoteOut(term= my_raft.term, voteGranted= True)
-    print("Denied", in_params.candidateId, datetime.now())#, my_raft.role == "follower", my_raft.term <= in_params.term, my_raft.vote_for == None, my_raft.last_ping + timedelta(drop_timeout) <= datetime.now(), datetime.now())
+    print("Denied", in_params.candidateId, my_raft.leader_port)#, my_raft.role == "follower", my_raft.term <= in_params.term, my_raft.vote_for == None, my_raft.last_ping + timedelta(drop_timeout) <= datetime.now(), datetime.now())
     return VoteOut(term= my_raft.term, voteGranted= False)
+
+@api_v1.method(errors=[MyError])
+async def get_logs() -> list[Any]:
+   return my_raft.log
 
 def signal_handler(sig, frame):
     my_raft.stop()
