@@ -25,7 +25,6 @@ initial_port = sys.argv[1]
 
 api_v1 = jsonrpc.Entrypoint('/api/v1/jsonrpc')
 
-ping_timeout = 0.1
 vote_timeout = 0.1
 action_timeout = 0.1
 hb_timer = 0.1
@@ -150,7 +149,7 @@ class MySyncObj():
         self.log.append((act, target, term))
         print("New log ", act, target, term)
 
-    async def append(self, node):
+    async def ping(self, node):
         url = "http://"+ self.cur_host + ":" + str(node) + "/api/v1/jsonrpc"
         headers = {'content-type': 'application/json'}
         
@@ -173,19 +172,19 @@ class MySyncObj():
         }
         }
         try:
-            response = requests.post(url, json=data, headers=headers, timeout=ping_timeout)
+            response = requests.post(url, json=data, headers=headers, timeout=hb_timer)
             if response.status_code ==  200:
                 self.nodes[node] = datetime.now()
                 if response.json()["result"]["term"] > self.term:
                     self.role = "follower"
-                    print("WTF App", node)
+                    print("WTF App ", node)
                 elif response.json()["result"]["success"]:
                     self.matchIndex[node] = self.commitIndex
                 else:
                     self.matchIndex[node] = self.matchIndex[node] - 1
                 return
         except Exception as e:
-            print(f"Node {node} append failed")
+            print(f"Node {node} hb failed")
         
         if (node in self.nodes and self.nodes[node] + timedelta(seconds=drop_timeout) < datetime.now()):
             self.new_log("Drop", node, self.term)
@@ -200,7 +199,7 @@ class MySyncObj():
         asyncio.run(self.KostbILb())
     
     async def KostbILb(self):
-        tasks = [asyncio.create_task(self.append(x)) for x in self.nodes.keys() if x != self.cur_port]
+        tasks = [asyncio.create_task(self.ping(x)) for x in self.nodes.keys() if x != self.cur_port]
         # print("hb", self.log, self.commitIndex)
         results = await asyncio.gather(*tasks)
      
