@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 import time
 import random
 import asyncio
-# import httpx БАН
+# import httpx
 import requests
 import sys
 import signal
@@ -41,7 +41,6 @@ class RepeatTimer(Timer):
 class MyError(jsonrpc.BaseError):
     CODE = 5000
     MESSAGE = 'My error'
-
     class DataModel(BaseModel):
         details: str
 
@@ -68,14 +67,14 @@ class MySyncObj():
     cur_host = 'localhost'
     role = "follower" #'leader'
 
-    cur_port = int(initial_port) #8010
+    cur_port = int(initial_port)
     term = 0
     leader_port = 8010
 
     vote_for = None
     log : list[(str, int ,int)] = [] # index (log, target ,term)
-    commitIndex = 0
-    lastApplied = 0 ####
+    commitIndex = -1
+    lastApplied = -1
 
     nextIndex = {} #####
     matchIndex : Dict[int,int] = {} # node, idx
@@ -99,14 +98,14 @@ class MySyncObj():
             self.load_log_from_file()
             self.role = "follower"
         else:
-            self.new_log("Node build", self.cur_port, self.term)
+            # self.new_log("Node build", self.cur_port, self.term)
             print("connect")
             self.new_log("Add", self.leader_port, 0)
            
     def new_log(self, act, target, term):
         if (act == "Add"):
             self.nodes[target] = datetime.now()
-            self.matchIndex[target] = self.commitIndex
+            self.matchIndex[target] = self.lastApplied
         if (act == "Drop"):
             if  target in self.nodes:
                 del self.nodes[target]
@@ -118,7 +117,7 @@ class MySyncObj():
         #    if (self.term > term):
         #        print("(0-0) log leader term warning")
         if act != "Node build":
-            self.commitIndex = self.commitIndex + 1
+            self.lastApplied = self.lastApplied + 1
         self.log.append((act, target, term))
         print("New log ", act, target, term)
 
@@ -146,10 +145,10 @@ class MySyncObj():
         url = "http://"+ self.cur_host + ":" + str(node) + "/api/v1/jsonrpc"
         headers = {'content-type': 'application/json'}
         
-        prevLogIndex = max(self.matchIndex[node], 1)
+        prevLogIndex = max(self.matchIndex[node], 0)
        
         prevLogTerm = self.log[prevLogIndex][2]
-        entries = self.log[prevLogIndex:self.commitIndex+1] 
+        entries = self.log[prevLogIndex + 1:self.lastApplied+1] 
 
         # print(node, prevLogIndex, self.commitIndex)
         
@@ -158,15 +157,15 @@ class MySyncObj():
             "method": "append",
             "id": 1,
             "params": {
-            "in_params": {
-                "term": self.term,
-                "leaderId": self.cur_port,
-                "prevLogIndex": prevLogIndex,
-                "prevLogTerm": prevLogTerm,
-                "entries": entries,
-                "leaderCommit": self.commitIndex
+                "in_params": {
+                    "term": self.term,
+                    "leaderId": self.cur_port,
+                    "prevLogIndex": prevLogIndex,
+                    "prevLogTerm": prevLogTerm,
+                    "entries": entries,
+                    "leaderCommit": self.commitIndex
+                    }
             }
-        }
         }
         try:
             response = requests.post(url, json=data, headers=headers, timeout=hb_timer)
@@ -176,12 +175,12 @@ class MySyncObj():
                     self.role = "follower"
                     print("WTF App ", node)
                 elif response.json()["result"]["success"]:
-                    self.matchIndex[node] = self.commitIndex
+                    self.matchIndex[node] = self.lastApplied
                 else:
                     self.matchIndex[node] = self.matchIndex[node] - 1
                 return
         except Exception as e:
-            print(f"Node {node} hb failed")
+            print(f"Node {node} hb failed", prevLogIndex)
         
         if (node in self.nodes and self.nodes[node] + timedelta(seconds=drop_timeout) < datetime.now()):
             self.new_log("Drop", node, self.term)
@@ -198,6 +197,10 @@ class MySyncObj():
     async def KostbILb(self):
         tasks = [asyncio.create_task(self.ping(x)) for x in self.nodes.keys() if x != self.cur_port]
         # print("hb", self.log, self.commitIndex)
+        
+        if (self.commitIndex < self.lastApplied and 
+            sum(1 for value in self.matchIndex.values() if value > self.commitIndex) >= len(self.matchIndex.values()) / 2):
+            self.commitIndex = self.commitIndex +1
         results = await asyncio.gather(*tasks)
      
     async def send_vote_request(self, node):
@@ -211,8 +214,8 @@ class MySyncObj():
                 "in_params": {
                     "term": self.term,
                     "candidateId": self.cur_port,
-                    "lastLogIndex": self.commitIndex,
-                    "lastLogTerm": self.log[self.commitIndex-1][1]
+                    "lastLogIndex": self.lastApplied,
+                    "lastLogTerm": self.log[self.lastApplied-1][1]
                 }
             }
         }
@@ -297,7 +300,7 @@ class MySyncObj():
 
 @api_v1.method(errors=[MyError])
 async def append(in_params: AppendEntriesIn) -> AppendEntriesOut:
-    # print("app get", my_raft.log, my_raft.commitIndex)
+    # print("app get", my_raft.log, my_raft.lastApplied)
     # print(in_params)
     
     if(my_raft.term > in_params.term):
@@ -310,25 +313,25 @@ async def append(in_params: AppendEntriesIn) -> AppendEntriesOut:
         print("WTF new leader")
         my_raft.role = "follower"
 
-    if(my_raft.commitIndex == in_params.prevLogIndex == in_params.leaderCommit and in_params.prevLogTerm == my_raft.log[in_params.prevLogIndex][2]):
+    if(my_raft.lastApplied == in_params.prevLogIndex == in_params.leaderCommit and in_params.prevLogTerm == my_raft.log[in_params.prevLogIndex][2]):
         return AppendEntriesOut(term= my_raft.term, success= True)
         
-    if(my_raft.commitIndex < in_params.prevLogIndex and in_params.prevLogIndex > 1 or 
-       (my_raft.commitIndex == in_params.prevLogIndex and my_raft.log[in_params.prevLogIndex][2] != in_params.prevLogTerm)):
+    if(my_raft.lastApplied < in_params.prevLogIndex or 
+       (my_raft.lastApplied == in_params.prevLogIndex and my_raft.log[in_params.prevLogIndex][2] != in_params.prevLogTerm)):
         return AppendEntriesOut(term= my_raft.term, success= False) 
     
     my_raft.leader_port = in_params.leaderId
 
     if(in_params.prevLogIndex == 1):
-        my_raft.log = my_raft.log[:in_params.prevLogIndex]
+        my_raft.log = my_raft.log[:in_params.prevLogIndex+1]
     else:
-        in_params.entries = in_params.entries[1:]
         my_raft.log = my_raft.log[:in_params.prevLogIndex+1]
 
     for x in in_params.entries:
         my_raft.new_log(x[0], x[1], x[2])
 
     my_raft.term = in_params.term
+    my_raft.lastApplied = len(my_raft.log)-1
     my_raft.commitIndex = in_params.leaderCommit
 
     return AppendEntriesOut(term = my_raft.term, success= True) 
@@ -349,7 +352,14 @@ async def vote(in_params: VoteIn) -> VoteOut:
 
 @api_v1.method(errors=[MyError])
 async def get_logs() -> list[Any]:
-   return my_raft.log
+   return [
+        my_raft.cur_port,
+        my_raft.commitIndex,
+        my_raft.lastApplied, 
+        my_raft.leader_port,
+        my_raft.term,
+        my_raft.nodes,
+        my_raft.log]
 
 def signal_handler(sig, frame):
     my_raft.stop()
