@@ -20,15 +20,17 @@ import requests
 import sys
 import signal
 
+import json
 
 initial_port = sys.argv[1]
+load_logs = len(sys.argv) > 2
 
 api_v1 = jsonrpc.Entrypoint('/api/v1/jsonrpc')
 
 vote_timeout = 0.1
 action_timeout = 0.1
-hb_timer = 0.1
-drop_timeout = 0.5
+hb_timer = 0.1 # 0.1
+drop_timeout = 0.5#0.5
 sleep_max_time = 2
 
 class RepeatTimer(Timer):
@@ -76,7 +78,7 @@ class MySyncObj():
     leader_port = 8010
 
     vote_for = None
-    log : list[(str, int ,int)]= [("Born", cur_port, term)] # index (log, target ,term)
+    log : list[(str, int ,int)] = [] # index (log, target ,term)
     commitIndex = 0
     lastApplied = 0 ####
 
@@ -85,7 +87,7 @@ class MySyncObj():
 
     nodes : Dict[int, Any] = {}
     vote_start = datetime.now()
-    vote_state = "drop" # drop -> sleep -> candidat/vote
+    vote_state = "sleep" # sleep -> drop -> candidat/vote
     #HB
     steps = (drop_timeout//hb_timer)//3
     curr_step = 0
@@ -95,12 +97,16 @@ class MySyncObj():
         self.riot = Timer(time, self.do_work)
         self.riot.start()
 
-    def __init__(self):
+    def __init__(self, load_logs):
         self.heartbeat = RepeatTimer(hb_timer, self.hearthbit)
         self.riot = Timer(drop_timeout, self.wait)
-        
-        print("connect")
-        asyncio.run(self.connect_to_net(self.leader_port))
+        if load_logs == True:
+            self.load_log_from_file()
+            self.role = "follower"
+        else:
+            self.new_log("Node build", self.cur_port, self.term)
+            print("connect")
+            asyncio.run(self.connect_to_net(self.leader_port))
 
     async def connect_to_net(self, port):
         url = "http://"+ self.cur_host + ":" + str(port) + "/api/v1/jsonrpc"
@@ -132,10 +138,8 @@ class MySyncObj():
            
     def new_log(self, act, target, term):
         if (act == "Add"):
-            if target in self.nodes:
-                return
             self.nodes[target] = datetime.now()
-            self.matchIndex[target] = 0
+            self.matchIndex[target] = self.commitIndex
         if (act == "Drop"):
             if  target in self.nodes:
                 del self.nodes[target]
@@ -144,18 +148,45 @@ class MySyncObj():
                 return
         if act == "Lead":
            self.leader_port = target
-        
-        self.commitIndex = self.commitIndex + 1
+        #    if (self.term > term):
+        #        print("(0-0) log leader term warning")
+           self.term = term
+        if act != "Node build":
+            self.commitIndex = self.commitIndex + 1
         self.log.append((act, target, term))
         print("New log ", act, target, term)
+
+    def save_log_to_file(self):
+        try:
+            filename = str(self.cur_port) + "_log.json"
+            with open(filename, 'w') as file:
+                json.dump(self.log, file, indent=4)
+            print(f"Лог успешно сохранен в {filename}")
+        except Exception as e:
+            print(f"Ошибка при сохранении лога: {e}")
+
+    def load_log_from_file(self):
+        try:
+            filename = str(self.cur_port) + "_log.json"
+            with open(filename, 'r') as file:
+                log_json = json.load(file)
+            print(f"Лог успешно загружен из {filename}")
+        except Exception as e:
+            print(f"Ошибка при загрузке лога: {e}")
+        for (act, target, term) in log_json:
+            self.new_log(act, target, term)
 
     async def ping(self, node):
         url = "http://"+ self.cur_host + ":" + str(node) + "/api/v1/jsonrpc"
         headers = {'content-type': 'application/json'}
         
-        prevLogIndex = self.matchIndex[node]
+        prevLogIndex = max(self.matchIndex[node], 1)
+       
         prevLogTerm = self.log[prevLogIndex][2]
-        entries = self.log[prevLogIndex+1:self.commitIndex+1] 
+        entries = self.log[prevLogIndex:self.commitIndex+1] 
+
+        # print(node, prevLogIndex, self.commitIndex)
+        
         data = {
             "jsonrpc": "2.0",
             "method": "append",
@@ -227,7 +258,6 @@ class MySyncObj():
                 return 1
             if response.status_code == 200 and response.json()['result']['term'] > self.term:
                 self.role = "follower"
-                self.term = response.json()['result']['term']
                 print("WTF Vote")
                 return 0
         except requests.exceptions.RequestException as e:
@@ -241,12 +271,12 @@ class MySyncObj():
             tasks = [asyncio.create_task(self.send_vote_request(node)) for node in self.nodes if node != self.cur_port]
             results = await asyncio.gather(*tasks, return_exceptions=True)
             votes = sum(results) + 1
-            print(f"Election finished\n{votes}/{len(tasks)}")
+            print(f"Election finished\n{votes}/{len(tasks) + 1}")
 
-            if (votes >len(tasks)/2 and self.role == "candidat"):               
+            if (votes * 2 > len(tasks)  and self.role == "candidat"):               
                 self.role = "leader"
                 self.leader_port = self.cur_port
-                self.vote_state = "drop"
+                self.vote_state = "sleep"
                 if len(self.nodes) == 0:
                     self.new_log("Add", self.cur_port, self.term)
                 self.new_log("Lead", self.cur_port, self.term)
@@ -265,16 +295,16 @@ class MySyncObj():
         
     def do_work(self):        
         if self.role == "follower":
-            if self.vote_state == "drop":
+            if self.vote_state == "sleep":
                 sleep_duration = random.uniform(0, sleep_max_time) 
                 print("leader Drop. sleep ", sleep_duration*1000//1)
-                self.vote_state = "sleep"
+                self.vote_state = "drop"
                 self.vote_for = None
                 self.wait(time = sleep_duration)
-            elif self.vote_state == "sleep" and self.vote_for == None:
+            elif self.vote_state == "drop" and self.vote_for == None:
                 print("try to lead")
                 self.role = "candidat"
-                self.vote_state = "drop"
+                self.vote_state = "vote"
                 self.vote_for = self.cur_port
                 asyncio.run(self.coronation())
                 self.wait(time = vote_timeout)
@@ -295,6 +325,7 @@ class MySyncObj():
 
     def stop(self):
         print(self.log)
+        self.save_log_to_file()
         self.heartbeat.cancel()
         self.riot.cancel()
 
@@ -308,26 +339,34 @@ async def add_to_list(in_params: AddNodeIn) -> AddNodeOut:
 
 @api_v1.method(errors=[MyError])
 async def append(in_params: AppendEntriesIn) -> AppendEntriesOut:
-    # print("app get", my_raft.log, in_params)
+    # print("app get", my_raft.log, my_raft.commitIndex)
+    # print(in_params)
+    
     if(my_raft.term > in_params.term):
         return AppendEntriesOut(term= my_raft.term, success= False)
     
     my_raft.wait(time = drop_timeout)
-    my_raft.vote_state = "drop"
+    my_raft.vote_state = "sleep"
 
     if(my_raft.role != "follower" and my_raft.term < in_params.term):
-        print("WTF")
+        print("WTF new leader")
         my_raft.role = "follower"
-    if(my_raft.commitIndex == in_params.prevLogIndex == in_params.leaderCommit and in_params.prevLogTerm == my_raft.log[in_params.prevLogIndex-1][2]):
+
+    if(my_raft.commitIndex == in_params.prevLogIndex == in_params.leaderCommit and in_params.prevLogTerm == my_raft.log[in_params.prevLogIndex][2]):
         return AppendEntriesOut(term= my_raft.term, success= True)
         
-    if(my_raft.commitIndex < in_params.prevLogIndex or 
-       (my_raft.commitIndex == in_params.prevLogIndex and my_raft.log[in_params.prevLogIndex - 1][2] != in_params.prevLogTerm)):
+    if(my_raft.commitIndex < in_params.prevLogIndex and in_params.prevLogIndex > 1 or 
+       (my_raft.commitIndex == in_params.prevLogIndex and my_raft.log[in_params.prevLogIndex][2] != in_params.prevLogTerm)):
         return AppendEntriesOut(term= my_raft.term, success= False) 
     
-    
     my_raft.leader_port = in_params.leaderId
-    my_raft.log = my_raft.log[:in_params.prevLogIndex+1]
+
+    if(in_params.prevLogIndex == 1):
+        my_raft.log = my_raft.log[:in_params.prevLogIndex]
+    else:
+        in_params.entries = in_params.entries[1:]
+        my_raft.log = my_raft.log[:in_params.prevLogIndex+1]
+
     for x in in_params.entries:
         my_raft.new_log(x[0], x[1], x[2])
 
@@ -338,13 +377,16 @@ async def append(in_params: AppendEntriesIn) -> AppendEntriesOut:
 
 @api_v1.method(errors=[MyError])
 async def vote(in_params: VoteIn) -> VoteOut:
-    if my_raft.role == "follower" and my_raft.term <= in_params.term and my_raft.vote_for == None and my_raft.vote_state == "sleep":
+    if my_raft.role == "follower" and my_raft.term <= in_params.term and my_raft.vote_for == None and my_raft.vote_state == "drop":
         my_raft.vote_for = in_params.candidateId
+        my_raft.vote_state = "drop"
         my_raft.wait(vote_timeout)
         my_raft.term = in_params.term
         print("request vote for ", in_params.candidateId)
         return VoteOut(term= my_raft.term, voteGranted= True)
     print("Denied", in_params.candidateId, my_raft.leader_port)
+    if(my_raft.term >= in_params.term and my_raft.role == "leader" and in_params.candidateId not in my_raft.nodes.keys()):
+        my_raft.new_log("Add", in_params.candidateId, my_raft.term)
     return VoteOut(term= my_raft.term, voteGranted= False)
 
 @api_v1.method(errors=[MyError])
@@ -356,7 +398,7 @@ def signal_handler(sig, frame):
     sys.exit(0) 
 
 if __name__ == '__main__':
-    my_raft = MySyncObj()
+    my_raft = MySyncObj(load_logs)
 
     @asynccontextmanager
     async def lifespan(app: jsonrpc.API):
@@ -366,7 +408,7 @@ if __name__ == '__main__':
     app = jsonrpc.API(lifespan=lifespan)
     app.bind_entrypoint(api_v1)
 
-    signal.signal(signal.SIGINT, signal_handler)  # Add signal handler
+    signal.signal(signal.SIGINT, signal_handler)
     
     import uvicorn
     uvicorn.run(app, host=my_raft.cur_host, port=my_raft.cur_port, log_level='critical')
