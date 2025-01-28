@@ -57,15 +57,15 @@ class VoteOut(BaseModel):
     term: int
     voteGranted: bool
 class AppendEntriesIn(BaseModel):
-    term: int #term leader’sterm 
-    leaderId: int # sofollowercanredirectclients
-    prevLogIndex: int # index of log entry immediately preceding new ones
-    prevLogTerm: int # term of prev Log Indexentry
-    entries: list[tuple[str, int, int]] #logentriestostore(emptyforheartbeat; maysendmorethanoneforefficiency)
-    leaderCommit: int #leader’s commitIndex
+    term: int
+    leaderId: int 
+    prevLogIndex: int
+    prevLogTerm: int
+    entries: list[tuple[str, int, int]]
+    leaderCommit: int
 class AppendEntriesOut(BaseModel):
-    term: int# currentTerm,forleadertoupdateitself
-    success: bool# trueiffollowercontainedentrymatching prevLogIndexandprevLogTerm
+    term: int
+    success: bool
     
 class MySyncObj():
     cur_host = 'localhost'
@@ -83,7 +83,7 @@ class MySyncObj():
     nextIndex = {} #####
     matchIndex : Dict[int,int] = {} # node, idx
 
-    nodes : Dict[int, Any] = {}#, 8016:0} # 8010
+    nodes : Dict[int, Any] = {}
     vote_start = datetime.now()
     vote_state = "drop" # drop -> sleep -> candidat/vote
     #HB
@@ -238,11 +238,8 @@ class MySyncObj():
         if (self.vote_for == self.cur_port) :
             votes = 1
             self.term = self.term + 1
-            # self.send_vote_request(8016)
-            # print(datetime.now())
             tasks = [asyncio.create_task(self.send_vote_request(node)) for node in self.nodes if node != self.cur_port]
             results = await asyncio.gather(*tasks, return_exceptions=True)
-            # print(datetime.now())
             votes = sum(results) + 1
             print(f"Election finished\n{votes}/{len(tasks)}")
 
@@ -347,7 +344,7 @@ async def vote(in_params: VoteIn) -> VoteOut:
         my_raft.term = in_params.term
         print("request vote for ", in_params.candidateId)
         return VoteOut(term= my_raft.term, voteGranted= True)
-    print("Denied", in_params.candidateId, my_raft.leader_port)#, my_raft.role == "follower", my_raft.term <= in_params.term, my_raft.vote_for == None, my_raft.last_ping + timedelta(drop_timeout) <= datetime.now(), datetime.now())
+    print("Denied", in_params.candidateId, my_raft.leader_port)
     return VoteOut(term= my_raft.term, voteGranted= False)
 
 @api_v1.method(errors=[MyError])
