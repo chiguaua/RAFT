@@ -45,11 +45,6 @@ class MyError(jsonrpc.BaseError):
     class DataModel(BaseModel):
         details: str
 
-class AddNodeIn(BaseModel):
-    item: int
-class AddNodeOut(BaseModel):
-    leader: int
-
 class VoteIn(BaseModel):
     term: int
     candidateId: int
@@ -106,35 +101,7 @@ class MySyncObj():
         else:
             self.new_log("Node build", self.cur_port, self.term)
             print("connect")
-            asyncio.run(self.connect_to_net(self.leader_port))
-
-    async def connect_to_net(self, port):
-        url = "http://"+ self.cur_host + ":" + str(port) + "/api/v1/jsonrpc"
-        headers = {'content-type': 'application/json'}
-        data = {
-            "jsonrpc": "2.0",
-            "method": "add_to_list",
-            "id": 1,
-            "params": {
-            "in_params": {
-                "item": self.cur_port 
-            }
-        }
-        }
-        leader_get = port
-
-        try:
-            response = requests.post(url, json=data, headers=headers, timeout=drop_timeout)
-            leader_get = response.json()["result"]["leader"]
-        except Exception as e:
-            print("Fail connect ")
-        
-        if (leader_get == port) and  (port != leader_get):
-            print("Succ connect ", port)
-            self.leader_port = port
-            self.wait(time = drop_timeout)
-        elif (port != leader_get):
-            self.connect_to_net(leader_get)
+            self.new_log("Add", self.leader_port, 0)
            
     def new_log(self, act, target, term):
         if (act == "Add"):
@@ -150,7 +117,6 @@ class MySyncObj():
            self.leader_port = target
         #    if (self.term > term):
         #        print("(0-0) log leader term warning")
-           self.term = term
         if act != "Node build":
             self.commitIndex = self.commitIndex + 1
         self.log.append((act, target, term))
@@ -273,7 +239,7 @@ class MySyncObj():
             votes = sum(results) + 1
             print(f"Election finished\n{votes}/{len(tasks) + 1}")
 
-            if (votes * 2 > len(tasks)  and self.role == "candidat"):               
+            if (votes * 2 > len(tasks) + 1  and self.role == "candidat"):               
                 self.role = "leader"
                 self.leader_port = self.cur_port
                 self.vote_state = "sleep"
@@ -328,14 +294,6 @@ class MySyncObj():
         self.save_log_to_file()
         self.heartbeat.cancel()
         self.riot.cancel()
-
-@api_v1.method(errors=[MyError])
-async def add_to_list(in_params: AddNodeIn) -> AddNodeOut:
-    if (my_raft.role != "follower"):
-        my_raft.new_log("Add", in_params.item, my_raft.term)
-    else:
-        print(f"route {in_params.item} to leader {my_raft.leader_port}")
-    return AddNodeOut(leader=my_raft.leader_port) 
 
 @api_v1.method(errors=[MyError])
 async def append(in_params: AppendEntriesIn) -> AppendEntriesOut:
