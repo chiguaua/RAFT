@@ -100,18 +100,20 @@ class MySyncObj():
         else:
             # self.new_log("Node build", self.cur_port, self.term)
             print("connect")
-            self.new_log("Add", self.leader_port, 0)
+            # self.new_log("Add", self.leader_port, 0)
+            for i in [8010, 8011, 8012, 8013, 8014]:
+                self.new_log("Add", i, 0)
            
     def new_log(self, act, target, term):
         if (act == "Add"):
             self.nodes[target] = datetime.now()
             self.matchIndex[target] = self.lastApplied
-        if (act == "Drop"):
-            if  target in self.nodes:
-                del self.nodes[target]
-                del self.matchIndex[target]
-            else:
-                return
+        # if (act == "Drop"):
+            # if  target in self.nodes:
+            #     del self.nodes[target]
+            #     del self.matchIndex[target]
+            # else:
+            #     return
         if act == "Lead":
            self.leader_port = target
         self.lastApplied = self.lastApplied + 1
