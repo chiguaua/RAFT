@@ -27,11 +27,11 @@ load_logs = len(sys.argv) > 2
 
 api_v1 = jsonrpc.Entrypoint('/api/v1/jsonrpc')
 
-vote_timeout = 0.1
+vote_timeout = 0.5
 action_timeout = 0.1
 hb_timer = 0.1 # 0.1
 drop_timeout = 0.5#0.5
-sleep_max_time = 2
+sleep_max_time = 0.3
 
 class RepeatTimer(Timer):
     def run(self):
@@ -57,7 +57,7 @@ class AppendEntriesIn(BaseModel):
     leaderId: int 
     prevLogIndex: int
     prevLogTerm: int
-    entries: list[tuple[str, int, int]]
+    entries: list[tuple[str, Any, int]]
     leaderCommit: int
 class AppendEntriesOut(BaseModel):
     term: int
@@ -114,10 +114,7 @@ class MySyncObj():
                 return
         if act == "Lead":
            self.leader_port = target
-        #    if (self.term > term):
-        #        print("(0-0) log leader term warning")
-        if act != "Node build":
-            self.lastApplied = self.lastApplied + 1
+        self.lastApplied = self.lastApplied + 1
         self.log.append((act, target, term))
         print("New log ", act, target, term)
 
@@ -180,7 +177,7 @@ class MySyncObj():
                     self.matchIndex[node] = self.matchIndex[node] - 1
                 return
         except Exception as e:
-            print(f"Node {node} hb failed", prevLogIndex)
+            print(f"Node {node} hb failed")
         
         if (node in self.nodes and self.nodes[node] + timedelta(seconds=drop_timeout) < datetime.now()):
             self.new_log("Drop", node, self.term)
@@ -215,7 +212,7 @@ class MySyncObj():
                     "term": self.term,
                     "candidateId": self.cur_port,
                     "lastLogIndex": self.lastApplied,
-                    "lastLogTerm": self.log[self.lastApplied-1][1]
+                    "lastLogTerm": self.log[self.lastApplied][2]
                 }
             }
         }
@@ -227,13 +224,13 @@ class MySyncObj():
                 return 1
             if response.status_code == 200 and response.json()['result']['term'] > self.term:
                 self.role = "follower"
-                print("WTF Vote")
+                # print("WTF Vote")
                 return 0
         except requests.exceptions.RequestException as e:
             print(f"{node} vote failed")
         return 0  
     
-    async def coronation(self):
+    async def try_lead(self):
         if (self.vote_for == self.cur_port) :
             votes = 1
             self.term = self.term + 1
@@ -275,7 +272,7 @@ class MySyncObj():
                 self.role = "candidat"
                 self.vote_state = "vote"
                 self.vote_for = self.cur_port
-                asyncio.run(self.coronation())
+                asyncio.run(self.try_lead())
                 self.wait(time = vote_timeout)
             else:
                 sleep_duration = random.uniform(0, sleep_max_time) 
@@ -300,9 +297,7 @@ class MySyncObj():
 
 @api_v1.method(errors=[MyError])
 async def append(in_params: AppendEntriesIn) -> AppendEntriesOut:
-    # print("app get", my_raft.log, my_raft.lastApplied)
-    # print(in_params)
-    
+    print(in_params.term)
     if(my_raft.term > in_params.term):
         return AppendEntriesOut(term= my_raft.term, success= False)
     
@@ -321,11 +316,7 @@ async def append(in_params: AppendEntriesIn) -> AppendEntriesOut:
         return AppendEntriesOut(term= my_raft.term, success= False) 
     
     my_raft.leader_port = in_params.leaderId
-
-    if(in_params.prevLogIndex == 1):
-        my_raft.log = my_raft.log[:in_params.prevLogIndex+1]
-    else:
-        my_raft.log = my_raft.log[:in_params.prevLogIndex+1]
+    my_raft.log = my_raft.log[:in_params.prevLogIndex+1]
 
     for x in in_params.entries:
         my_raft.new_log(x[0], x[1], x[2])
@@ -338,13 +329,19 @@ async def append(in_params: AppendEntriesIn) -> AppendEntriesOut:
 
 @api_v1.method(errors=[MyError])
 async def vote(in_params: VoteIn) -> VoteOut:
-    if my_raft.role == "follower" and my_raft.term <= in_params.term and my_raft.vote_for == None and my_raft.vote_state == "drop":
-        my_raft.vote_for = in_params.candidateId
-        my_raft.vote_state = "drop"
-        my_raft.wait(vote_timeout)
-        my_raft.term = in_params.term
-        print("request vote for ", in_params.candidateId)
-        return VoteOut(term= my_raft.term, voteGranted= True)
+    if ( 
+        my_raft.lastApplied <= in_params.lastLogIndex
+        and my_raft.log[-1][2] <= in_params.lastLogTerm 
+        and my_raft.term <= in_params.term 
+        and my_raft.vote_for == None):
+        if (my_raft.role == "follower" 
+            and my_raft.vote_state == "drop"):
+            my_raft.vote_for = in_params.candidateId
+            my_raft.vote_state = "vote"
+            my_raft.wait(vote_timeout)
+            my_raft.term = in_params.term
+            print("request vote for ", in_params.candidateId)
+            return VoteOut(term= my_raft.term, voteGranted= True)
     print("Denied", in_params.candidateId, my_raft.leader_port)
     if(my_raft.term >= in_params.term and my_raft.role == "leader" and in_params.candidateId not in my_raft.nodes.keys()):
         my_raft.new_log("Add", in_params.candidateId, my_raft.term)
@@ -352,7 +349,7 @@ async def vote(in_params: VoteIn) -> VoteOut:
 
 @api_v1.method(errors=[MyError])
 async def get_logs() -> list[Any]:
-   return [
+    return [
         my_raft.cur_port,
         my_raft.commitIndex,
         my_raft.lastApplied, 
@@ -360,6 +357,24 @@ async def get_logs() -> list[Any]:
         my_raft.term,
         my_raft.nodes,
         my_raft.log]
+
+@api_v1.method(errors=[MyError])
+async def custom_log(in_params: Any) -> bool:
+    if my_raft.role == "leader":
+        my_raft.new_log("Custom log", in_params, my_raft.term)
+    else:
+        url = f"http://{my_raft.cur_host}:{my_raft.leader_port}/api/v1/jsonrpc"
+        headers = {'content-type': 'application/json'}
+        data = {
+            "jsonrpc": "2.0",
+            "method": "custom_log",
+            "id": 1,
+            "params": {
+                "in_params": in_params
+            }
+        }
+        requests.post(url, json=data, headers=headers, timeout=1)
+    return True
 
 def signal_handler(sig, frame):
     my_raft.stop()
