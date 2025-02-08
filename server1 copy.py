@@ -31,7 +31,7 @@ vote_timeout = 0.5
 action_timeout = 0.1
 hb_timer = 0.1 # 0.1
 drop_timeout = 0.5#0.5
-sleep_max_time = 0.3
+sleep_max_time = 0.5
 
 class RepeatTimer(Timer):
     def run(self):
@@ -108,12 +108,8 @@ class MySyncObj():
         if (act == "Add"):
             self.nodes[target] = datetime.now()
             self.matchIndex[target] = self.lastApplied
-        # if (act == "Drop"):
-            # if  target in self.nodes:
-            #     del self.nodes[target]
-            #     del self.matchIndex[target]
-            # else:
-            #     return
+        if (act == "Drop"):
+            self.nodes[target] = -1
         if act == "Lead":
            self.leader_port = target
         self.lastApplied = self.lastApplied + 1
@@ -179,9 +175,10 @@ class MySyncObj():
                     self.matchIndex[node] = self.matchIndex[node] - 1
                 return
         except Exception as e:
-            print(f"Node {node} hb failed")
+            if (-1 != self.nodes[node]):
+                print(f"Node {node} hb failed")
         
-        if (node in self.nodes and self.nodes[node] + timedelta(seconds=drop_timeout) < datetime.now()):
+        if (-1 != self.nodes[node] and node in self.nodes and self.nodes[node] + timedelta(seconds=drop_timeout) < datetime.now() ):
             self.new_log("Drop", node, self.term)
         
     def hearthbit(self):
